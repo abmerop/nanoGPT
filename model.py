@@ -101,8 +101,16 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        print("ln_1")
+        tmp1 = self.ln_1(x)
+        #x = x + self.attn(self.ln_1(x))
+        print("attn")
+        x = x + self.attn(tmp1)
+        print("ln_2")
+        tmp2 = self.ln_2(x)
+        #x = x + self.mlp(self.ln_2(x))
+        print("mlp")
+        x = x + self.mlp(tmp2)
         return x
 
 @dataclass
@@ -168,6 +176,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+        print("forward called")
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -175,11 +184,16 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        print("tok_em")
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        print("pos_emb")
         x = self.transformer.drop(tok_emb + pos_emb)
+        print("x1")
         for block in self.transformer.h:
             x = block(x)
+            break
         x = self.transformer.ln_f(x)
+        print("x2")
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -189,6 +203,8 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        print("forward done")
 
         return logits, loss
 
@@ -309,21 +325,29 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
+        for token_num in range(max_new_tokens):
+            print(f"{token_num = }")
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
+            print("before self()")
             logits, _ = self(idx_cond)
+            print("after self()")
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            print("logits")
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                print("top_k")
                 logits[logits < v[:, [-1]]] = -float('Inf')
+                print("filtered")
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            print("probs")
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            print("idx_next")
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
