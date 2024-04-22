@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+import sys
 import math
 import inspect
 from dataclasses import dataclass
@@ -14,6 +15,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+in_gem5 = True
+def gem5_print(pstr):
+    if in_gem5:
+        print(pstr)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -43,6 +49,7 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        #self.flash = False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -58,10 +65,19 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        gem5_print(f"{k.to('cpu') = }")
+        gem5_print(f"{q.to('cpu') = }")
+        gem5_print(f"{v.to('cpu') = }")
+
+        # v has some incorrect values compared to hardware
+        if in_gem5:
+            sys.exit(0)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            gem5_print(f"{y.to('cpu') = }")
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -70,9 +86,16 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        gem5_print(f"transpose {y.to('cpu') = }")
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        gem5_print(f"dropout {y.to('cpu') = }")
+
+        # dropout result is way off from hardware but not invalid
+        if in_gem5:
+            sys.exit(0)
+
         return y
 
 class MLP(nn.Module):
@@ -101,16 +124,21 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        print("ln_1")
-        tmp1 = self.ln_1(x)
         #x = x + self.attn(self.ln_1(x))
-        print("attn")
-        x = x + self.attn(tmp1)
-        print("ln_2")
-        tmp2 = self.ln_2(x)
         #x = x + self.mlp(self.ln_2(x))
-        print("mlp")
-        x = x + self.mlp(tmp2)
+        t = self.ln_1(x)
+        gem5_print(f"ln_1 {t.to('cpu') = }")
+        t = self.attn(t)
+        gem5_print(f"attn {t.to('cpu') = }")
+        x = x + t
+        gem5_print(f"intx {x.to('cpu') = }")
+
+        t = self.ln_2(x)
+        gem5_print(f"ln_2 {t.to('cpu') = }")
+        t = self.mlp(t)
+        gem5_print(f"mlp  {t.to('cpu') = }")
+        x = x + t
+        gem5_print(f"intx {x.to('cpu') = }")
         return x
 
 @dataclass
@@ -176,7 +204,6 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        print("forward called")
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -184,16 +211,13 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        print("tok_em")
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        print("pos_emb")
         x = self.transformer.drop(tok_emb + pos_emb)
-        print("x1")
+        gem5_print(f"{x.to('cpu') = }")
         for block in self.transformer.h:
+            gem5_print(f"{x.to('cpu') = }")
             x = block(x)
-            break
         x = self.transformer.ln_f(x)
-        print("x2")
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -203,8 +227,6 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-        print("forward done")
 
         return logits, loss
 
@@ -326,28 +348,24 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for token_num in range(max_new_tokens):
-            print(f"{token_num = }")
+            gem5_print(f"{token_num = }")
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            print("before self()")
             logits, _ = self(idx_cond)
-            print("after self()")
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            print("logits")
+            clogits = logits.to('cpu')
+            gem5_print(f"{clogits = }")
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                print("top_k")
                 logits[logits < v[:, [-1]]] = -float('Inf')
-                print("filtered")
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            print("probs")
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            print("idx_next")
+            gem5_print(f"{idx_next}")
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
